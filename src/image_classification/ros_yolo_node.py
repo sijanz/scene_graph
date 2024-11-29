@@ -11,7 +11,13 @@ import time
 from scene_graph.msg import DetectedObjects, DetectedObject
 from geometry_msgs.msg import Point32
 from std_msgs.msg import String
+from nav_msgs.msg import Odometry
 
+#!/usr/bin/env python
+
+import rospy
+import message_filters
+from sensor_msgs.msg import Image, PointCloud2
 
 class YOLOv9SegNode:
     
@@ -23,29 +29,49 @@ class YOLOv9SegNode:
         self.model = YOLO('yolov9e-seg.pt')
         self.model.to('cuda')
         # self.model.eval()
+        self.n = 0
+        self.in_cb = False
         
+        self.rgb_image = Image()
         self.depth_msg = PointCloud2()
+        self.odom_msg = Odometry()
 
         # Create a CvBridge object for converting ROS images to OpenCV
         self.bridge = CvBridge()
 
         # Subscribe to the camera image topic
-        self.image_sub = rospy.Subscriber('/camera/color/image_raw', Image, self.image_callback)
-        self.depth_sub = rospy.Subscriber('/camera/depth/pointcloud', PointCloud2, self.pointcloud_callback)
+        self.image_sub = message_filters.Subscriber('/camera/color/image_raw', Image)
+        self.depth_sub = message_filters.Subscriber('/camera/depth/points', PointCloud2)
+        self.odom_sub = message_filters.Subscriber('/odom', Odometry)
+        
+        # Approximate Time Synchronizer allows slight time differences between topics
+        ts = message_filters.ApproximateTimeSynchronizer([self.image_sub, self.depth_sub, self.odom_sub], queue_size=100, slop=0.03)
+        ts.registerCallback(self.synchronized_callback)
 
         # Publisher for the segmented image
-        self.image_pub = rospy.Publisher('/camera/color/segmented_image', Image, queue_size=1)
+        self.image_pub = rospy.Publisher('/scene_graph/color/image_raw', Image, queue_size=1)
+        self.segmented_image_pub = rospy.Publisher('/camera/color/segmented_image', Image, queue_size=1)
         self.depth_pub = rospy.Publisher('/scene_graph/depth/points', PointCloud2, queue_size=1)
+        self.odom_pub = rospy.Publisher('/scene_graph/odom', Odometry, queue_size=1)
         
-        self.detected_objects_pub = rospy.Publisher('/scene_graph/detected_objects', DetectedObjects, queue_size=1)
-        
-        
-    def pointcloud_callback(self, msg):
-        self.depth_msg = msg
+        self.detected_objects_pub = rospy.Publisher('/scene_graph/detected_objects', DetectedObjects, queue_size=10)
         
         
-    def image_callback(self, ros_image):
+    def synchronized_callback(self, ros_image, depth_msg, odom_msg):
         # Convert ROS Image message to OpenCV format
+        
+        # depth_msg = self.depth_msg
+        # odom_msg = self.odom_msg
+        
+        # self.n += 1
+        
+        # if not self.n % 10 == 0:
+        #     return
+        
+
+        
+        
+        print('in synchronized callback')
         
         start_time = time.time()
         
@@ -55,6 +81,8 @@ class YOLOv9SegNode:
             rospy.logerr("CvBridge Error: {0}".format(e))
             return
 
+        self.rgb_image = ros_image
+
         # Perform segmentation using YOLOv9 model
         results = self.model(cv_image)
         
@@ -62,8 +90,6 @@ class YOLOv9SegNode:
         masks = results[0].masks.data if results[0].masks is not None else None  # Assuming the output format includes masks in xyn format
         if masks is None:
             rospy.logwarn("No masks found in the image.")
-        
-        print(time.time() - start_time)
         
 
         detected_objects = []
@@ -90,6 +116,8 @@ class YOLOv9SegNode:
         lower_black = np.array([0,0,0])
         upper_black = np.array([0,0,1])
         
+        # print(time.time() - start_time)
+        rospy.loginfo(f'[TIMIMG]: {time.time() - start_time}')
         
         n = 0
         for i in indices:
@@ -125,16 +153,30 @@ class YOLOv9SegNode:
         # Apply the mask to the original image
         masked = cv2.bitwise_and(results[0].orig_img, results[0].orig_img, mask=masks)
                 
-        self.image_pub.publish(self.bridge.cv2_to_imgmsg(masked, encoding='bgr8'))
+        self.segmented_image_pub.publish(self.bridge.cv2_to_imgmsg(masked, encoding='bgr8'))
         
         detected_objects_msg = DetectedObjects()
-        detected_objects_msg.header.stamp = rospy.Time.now()
         detected_objects_msg.objects = detected_objects
+        detected_objects_msg.header.stamp = rospy.Time.now()
+        depth_msg.header.stamp = rospy.Time.now()
+        self.rgb_image.header.stamp = rospy.Time.now()
+        odom_msg.header.stamp = rospy.Time.now()
         
+        self.rgb_image.header.frame_id = 'map'
+        depth_msg.header.frame_id = 'map'
+        odom_msg.header.frame_id = 'map'
+        
+        print('depth: ', depth_msg.header.stamp.nsecs)
+        print('image: ', self.rgb_image.header.stamp.nsecs)
+        print('odom: ', odom_msg.header.stamp.nsecs)
+        print('detected objects: ', detected_objects_msg.header.stamp.nsecs)
+        
+        # publish depth image and odometry together with segmented image for synchronization
+        self.image_pub.publish(self.rgb_image)
+        self.depth_pub.publish(depth_msg)
+        self.odom_pub.publish(odom_msg)
         self.detected_objects_pub.publish(detected_objects_msg)
         
-        # publish depth image together with segmented image for synchronization
-        self.depth_pub.publish(self.depth_msg)
 
 
     def run(self):
