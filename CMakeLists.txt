@@ -25,6 +25,7 @@ find_package(catkin REQUIRED COMPONENTS
 	actionlib_msgs
   genmsg
   sensor_msgs
+  message_filters
 )
 
 # Set default build type to Release if not specified
